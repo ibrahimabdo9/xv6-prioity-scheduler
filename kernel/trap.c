@@ -169,6 +169,7 @@ clockintr()
     ticks++;
     wakeup(&ticks);
     release(&tickslock);
+    aging();  // boost priority of long-waiting RUNNABLE processes
   }
 
   // ask for the next timer interrupt. this also clears
