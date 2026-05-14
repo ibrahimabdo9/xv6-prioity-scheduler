@@ -124,7 +124,9 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
-  p->priority = 5;
+  p->priority = 50;    // default priority (0=highest, 200=lowest)
+  p->wait_ticks = 0;   // reset aging counter
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -279,6 +281,9 @@ kfork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  // Child inherits parent's priority.
+  np->priority = p->priority;
+
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
@@ -411,10 +416,78 @@ kwait(uint64 addr)
   }
 }
 
+// Set the priority of a process by pid.
+// priority must be in [0, 200]. Returns 0 on success, -1 on failure.
+int
+setprocpriority(int pid, int priority)
+{
+  struct proc *p;
+
+  if(priority < 0 || priority > 200)
+    return -1;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      p->priority = priority;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+// Get the priority of a process by pid.
+// Returns the priority on success, -1 if pid not found.
+int
+getprocpriority(int pid)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      int prio = p->priority;
+      release(&p->lock);
+      return prio;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+// Aging: called periodically from clockintr.
+// Every AGING_INTERVAL ticks, boost priority of RUNNABLE processes
+// that have been waiting (lower number = higher priority).
+#define AGING_INTERVAL 100
+
+void
+aging(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE){
+      p->wait_ticks++;
+      if(p->wait_ticks >= AGING_INTERVAL){
+        p->wait_ticks = 0;
+        if(p->priority > 0)
+          p->priority--;  // raise priority (lower number = higher priority)
+      }
+    } else {
+      p->wait_ticks = 0;  // reset when not waiting
+    }
+    release(&p->lock);
+  }
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
+//  - choose a process to run (highest priority = lowest number).
+//  - among equal-priority processes, round-robin.
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
@@ -424,54 +497,60 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
 
+  // last_scheduled: pointer to the last process we ran,
+  // used to implement round-robin among equal-priority processes.
+  static struct proc *last_scheduled = 0;
+
   c->proc = 0;
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    // Enable interrupts to avoid deadlock if all processes are waiting.
     intr_on();
     intr_off();
 
-    int found = 0;
-    struct proc *best=0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-  acquire(&p->lock);
-
-  if(p->state == RUNNABLE) {
-
-    if(best == 0 || p->priority > best->priority) {
-
-      if(best != 0)
-        release(&best->lock);
-
-      best = p;
-
-    } else {
+    // Step 1: find the minimum (best) priority among all RUNNABLE processes.
+    int min_prio = 201;  // higher than any valid priority
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state == RUNNABLE && p->priority < min_prio)
+        min_prio = p->priority;
       release(&p->lock);
     }
 
-  } else {
-    release(&p->lock);
-  }
-}
-
-if(best != 0) {
-  p = best;
-  found = 1;
-
-  p->state = RUNNING;
-  c->proc = p;
-
-  swtch(&c->context, &p->context);
-
-  c->proc = 0;
-  release(&p->lock);
-}
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    if(min_prio == 201){
+      // No runnable process found; wait for an interrupt.
       asm volatile("wfi");
+      continue;
+    }
+
+    // Step 2: round-robin among processes with min_prio.
+    // Start search from the slot AFTER last_scheduled (wrapping around).
+    struct proc *chosen = 0;
+    int start_idx = 0;
+    if(last_scheduled != 0)
+      start_idx = (int)(last_scheduled - proc) + 1;
+    if(start_idx >= NPROC)
+      start_idx = 0;
+
+    for(int i = 0; i < NPROC; i++){
+      int idx = (start_idx + i) % NPROC;
+      p = &proc[idx];
+      acquire(&p->lock);
+      if(p->state == RUNNABLE && p->priority == min_prio){
+        chosen = p;
+        // keep p->lock held — we need it to change state below
+        break;
+      }
+      release(&p->lock);
+    }
+
+    if(chosen != 0){
+      last_scheduled = chosen;
+      chosen->wait_ticks = 0;  // reset aging counter when scheduled
+      chosen->state = RUNNING;
+      c->proc = chosen;
+      swtch(&c->context, &chosen->context);
+      c->proc = 0;
+      release(&chosen->lock);
     }
   }
 }
@@ -698,7 +777,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printf("%d %s %s", p->pid, state, p->name);
+    printf("%d %s %s prio=%d", p->pid, state, p->name, p->priority);
     printf("\n");
   }
 }
