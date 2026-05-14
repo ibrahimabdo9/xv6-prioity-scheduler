@@ -105,3 +105,32 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// Set the priority of a process.
+// Arguments: pid (int), priority (int, 0=highest .. 200=lowest)
+// Returns 0 on success, -1 on failure.
+uint64
+sys_setpriority(void)
+{
+  int pid, priority;
+
+  argint(0, &pid);
+  argint(1, &priority);
+
+  if(priority < 0 || priority > 200)
+    return -1;
+
+  return setprocpriority(pid, priority);
+}
+
+// Get the priority of a process.
+// Arguments: pid (int)
+// Returns the priority value (0–200) on success, -1 if pid not found.
+uint64
+sys_getpriority(void)
+{
+  int pid;
+
+  argint(0, &pid);
+  return getprocpriority(pid);
+}
